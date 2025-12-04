@@ -1,229 +1,246 @@
-# bot_bitget_sol.py
-# Scalping fast: SOL/USDT on Bitget (ccxt) - "B1" config (many trades, TP gross 0.25%)
-# REQUIREMENTS: pip install ccxt python-dotenv
-# WARNING: KEEP dry_run=True while testing. Fill API keys before switching dry_run=False.
+import time, hmac, hashlib, base64, json, uuid, math, requests
+from dataclasses import dataclass
 
-import ccxt
-import time
-import math
-import os
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+# ================== CONFIG ==================
+API_KEY = "bg_aef3f1fd1131d53a300900a583720bfb"
+API_SECRET = "c4d69f7e3122eb858b45c9f2a7a30540e7e84597cae3103d3b189d9556b70da7"
+API_PASSPHRASE = "12345678"
 
-load_dotenv()  # optional: if you store keys in .env
+BASE_URL = "https://api.bitget.com"
 
-# ---------------- CONFIG ----------------
-SYMBOL = "SOL/USDT"
-EXCHANGE_ID = "bitget"
+SYMBOL = "ZECUSDT"      # spot symbol Bitget
+INVEST_USDT = 16.0
 
-# Trading behaviour
-DRY_RUN = True                 # True = simulate only, False = live
-CHECK_INTERVAL = 0.4           # seconds between checks (fast for many trades)
-DUMP_THRESHOLD = 0.0012       # 0.12% quick drop -> buy (aggressive, many-entry)
-PROFIT_TARGET_GROSS = 0.0025  # 0.25% gross target to consider selling
-STOP_LOSS = 0.0075            # 0.75% hard stop (protect capital) - adjust if wanted
+GRIDS = 6              # vốn 16 thì 4-6 aggressive là hợp lý
+RANGE_PCT = 0.03       # auto range ±3% quanh giá hiện tại
 
-# Fees (assumed taker; adjust if you know your fee tier)
-FEE_PER_SIDE = 0.001          # 0.1% per side by default => total 0.002
+SLEEP_SEC = 5
+HEARTBEAT_SEC = 10     # mỗi 10s in 1 dòng alive
+LOCALE = "en-US"
+# ============================================
 
-# Minimum notional to avoid tiny orders (exchange min cost)
-MIN_NOTIONAL_USDT = 5.0
 
-# Safety: fraction of USDT to use per buy (keep a tiny buffer for fees/precision)
-USE_USDT_FRAC = 0.98
+@dataclass
+class GridLevel:
+    price: float
+    buy_oid: str = ""
+    sell_oid: str = ""
 
-# ---------------- API KEYS (put into environment or paste directly) ----------------
-API_KEY = os.getenv("bg_aef3f1fd1131d53a300900a583720bfb") or "bg_aef3f1fd1131d53a300900a583720bfb"       # or paste your key here (not recommended)
-API_SECRET = os.getenv("c4d69f7e3122eb858b45c9f2a7a30540e7e84597cae3103d3b189d9556b70da7") or "c4d69f7e3122eb858b45c9f2a7a30540e7e84597cae3103d3b189d9556b70da7" # or paste your secret here
-API_PASSPHRASE = os.getenv("12345678") or "12345678"  # usually not needed for bitget
 
-# ---------------- SETUP EXCHANGE ----------------
-exchange = getattr(ccxt, EXCHANGE_ID)({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "password": API_PASSPHRASE,
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"}
-})
-exchange.load_markets()
+def ts_ms():
+    return str(int(time.time() * 1000))
 
-market = exchange.markets.get(SYMBOL)
-if not market:
-    raise SystemExit(f"Market {SYMBOL} not found on {EXCHANGE_ID}")
 
-base_asset = SYMBOL.split("/")[0]
-quote_asset = SYMBOL.split("/")[1]
+def sign_request(timestamp, method, request_path, body=""):
+    prehash = f"{timestamp}{method.upper()}{request_path}{body}"
+    mac = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
 
-# ---------------- Helpers ----------------
-def nowiso():
-    return datetime.now(timezone.utc).isoformat()
 
-def log(*args):
-    print(f"[{nowiso()}]", *args)
+def make_headers(method, path, body=""):
+    t = ts_ms()
+    sig = sign_request(t, method, path, body)
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sig,
+        "ACCESS-TIMESTAMP": t,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "locale": LOCALE,
+        "Content-Type": "application/json"
+    }
 
-def safe_call(fn, retries=3, delay=1.0):
-    for i in range(retries):
+
+def get_symbol_config(symbol):
+    path = "/api/v2/spot/public/symbols"
+    url = BASE_URL + path
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "00000":
+        raise RuntimeError(res)
+
+    items = res["data"]
+    cfg = next((x for x in items if x.get("symbol") == symbol), None)
+    if not cfg:
+        raise RuntimeError(f"Symbol {symbol} not found in config")
+
+    price_scale = int(cfg.get("priceScale", cfg.get("pricePrecision", 6)))
+    qty_scale   = int(cfg.get("quantityScale", cfg.get("quantityPrecision", 6)))
+
+    price_step = float(cfg.get("priceStep", 10 ** (-price_scale)))
+    qty_step   = float(cfg.get("quantityStep", 10 ** (-qty_scale)))
+
+    min_quote = float(
+        cfg.get("minTradeUSDT")
+        or cfg.get("minTradeAmount")
+        or cfg.get("minTradeQuote")
+        or 1.0
+    )
+    min_base = float(cfg.get("minTradeSize", cfg.get("minTradeBase", 0.0)) or 0.0)
+
+    return {
+        "price_scale": price_scale,
+        "qty_scale": qty_scale,
+        "price_step": price_step,
+        "qty_step": qty_step,
+        "min_quote": min_quote,
+        "min_base": min_base
+    }
+
+
+def round_step(x, step, scale):
+    if step <= 0:
+        return round(x, scale)
+    return round(math.floor(x / step) * step, scale)
+
+
+def get_last_price(symbol):
+    path = f"/api/v2/spot/market/tickers?symbol={symbol}"
+    url = BASE_URL + path
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "00000":
+        raise RuntimeError(res)
+    return float(res["data"][0]["lastPr"])
+
+
+def place_limit(symbol, side, price, size):
+    path = "/api/v2/spot/trade/place-order"
+    url = BASE_URL + path
+    body_dict = {
+        "symbol": symbol,
+        "side": side,
+        "orderType": "limit",
+        "force": "gtc",
+        "price": str(price),
+        "size": str(size),
+        "clientOid": str(uuid.uuid4()),
+    }
+    body = json.dumps(body_dict)
+    r = requests.post(url, headers=make_headers("POST", path, body), data=body, timeout=10)
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "00000":
+        raise RuntimeError(res)
+    return res["data"]["orderId"]
+
+
+def get_order(order_id):
+    path = f"/api/v2/spot/trade/orderInfo?orderId={order_id}"
+    url = BASE_URL + path
+    r = requests.get(url, headers=make_headers("GET", path), timeout=10)
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "00000":
+        raise RuntimeError(res)
+
+    data = res["data"]
+    if isinstance(data, list):
+        if not data:
+            raise RuntimeError("orderInfo returned empty list")
+        data = data[0]
+    return data
+
+
+def build_grid(lower, upper, n, cfg):
+    step = (upper - lower) / n
+    levels = []
+    for i in range(n + 1):
+        p = lower + step * i
+        p = round_step(p, cfg["price_step"], cfg["price_scale"])
+        levels.append(GridLevel(price=p))
+    return levels, step
+
+
+def main():
+    cfg = get_symbol_config(SYMBOL)
+    print("Symbol config:", cfg)
+
+    last = get_last_price(SYMBOL)
+    print("Current price:", last)
+
+    # ===== AUTO RANGE aggressive quanh giá hiện tại =====
+    lower = last * (1 - RANGE_PCT)
+    upper = last * (1 + RANGE_PCT)
+    lower = round_step(lower, cfg["price_step"], cfg["price_scale"])
+    upper = round_step(upper, cfg["price_step"], cfg["price_scale"])
+    print(f"Auto range: {lower} -> {upper} | grids={GRIDS}")
+    # ===================================================
+
+    levels, raw_step = build_grid(lower, upper, GRIDS, cfg)
+    print("Grid levels:", [lv.price for lv in levels])
+
+    buy_levels = [lv for lv in levels if lv.price < last]
+    if not buy_levels:
+        print("Price <= lower, no initial buys. Stop.")
+        return
+
+    usdt_per_buy = INVEST_USDT / len(buy_levels)
+    print("USDT per buy:", usdt_per_buy)
+
+    for lv in buy_levels:
+        size = usdt_per_buy / lv.price
+        size = round_step(size, cfg["qty_step"], cfg["qty_scale"])
+
+        if usdt_per_buy < cfg["min_quote"] or (cfg["min_base"] and size < cfg["min_base"]):
+            print(f"Skip BUY @ {lv.price}: below min")
+            continue
+
+        oid = place_limit(SYMBOL, "buy", lv.price, size)
+        lv.buy_oid = oid
+        print(f"Placed BUY {size} @ {lv.price}, oid={oid}")
+
+    last_heartbeat = time.time()
+
+    while True:
         try:
-            return fn()
+            for i, lv in enumerate(levels):
+
+                if lv.buy_oid:
+                    info = get_order(lv.buy_oid)
+                    if info.get("status") == "filled":
+                        filled_base = float(info["baseVolume"])
+                        lv.buy_oid = ""
+
+                        if i + 1 < len(levels):
+                            sell_lv = levels[i + 1]
+                            sell_size = round_step(filled_base, cfg["qty_step"], cfg["qty_scale"])
+                            oid = place_limit(SYMBOL, "sell", sell_lv.price, sell_size)
+                            sell_lv.sell_oid = oid
+                            print(f"BUY filled @ {lv.price} -> SELL {sell_size} @ {sell_lv.price}, oid={oid}")
+
+                if lv.sell_oid:
+                    info = get_order(lv.sell_oid)
+                    if info.get("status") == "filled":
+                        filled_quote = float(info["quoteVolume"])
+                        lv.sell_oid = ""
+
+                        if i - 1 >= 0:
+                            buy_lv = levels[i - 1]
+                            buy_size = filled_quote / buy_lv.price
+                            buy_size = round_step(buy_size, cfg["qty_step"], cfg["qty_scale"])
+
+                            if filled_quote < cfg["min_quote"] or (cfg["min_base"] and buy_size < cfg["min_base"]):
+                                print(f"Skip reBUY @ {buy_lv.price}: below min")
+                                continue
+
+                            oid = place_limit(SYMBOL, "buy", buy_lv.price, buy_size)
+                            buy_lv.buy_oid = oid
+                            print(f"SELL filled @ {lv.price} -> BUY {buy_size} @ {buy_lv.price}, oid={oid}")
+
+            # heartbeat cho biết bot còn sống
+            if time.time() - last_heartbeat >= HEARTBEAT_SEC:
+                cur = get_last_price(SYMBOL)
+                print(f"[alive] bot running | price now = {cur}")
+                last_heartbeat = time.time()
+
+            time.sleep(SLEEP_SEC)
+
         except Exception as e:
-            log("⚠ API retry", i+1, "error:", e)
-            time.sleep(delay)
-    return None
+            print("Loop error:", e)
+            time.sleep(SLEEP_SEC * 2)
 
-def amount_to_precision(sym, amt):
-    try:
-        a = exchange.amount_to_precision(sym, amt)
-        return float(a)
-    except Exception:
-        prec = market.get("precision", {}).get("amount")
-        if prec is not None:
-            factor = 10 ** prec
-            return math.floor(amt * factor) / factor
-        return float(round(amt, 8))
 
-def price_now():
-    t = safe_call(lambda: exchange.fetch_ticker(SYMBOL))
-    if not t:
-        return None
-    return float(t.get("last") or t.get("close"))
-
-def fetch_balances():
-    b = safe_call(lambda: exchange.fetch_balance())
-    if not b:
-        return None, None
-    free = b.get("free", {})
-    usdt_free = float(free.get(quote_asset, 0) or 0)
-    base_free = float(free.get(base_asset, 0) or 0)
-    return usdt_free, base_free
-
-def extract_fill_price(order):
-    if not order: return None
-    avg = order.get("average")
-    if avg:
-        try: return float(avg)
-        except: pass
-    info = order.get("info") or {}
-    fills = order.get("fills") or info.get("fills")
-    if fills and isinstance(fills, list) and len(fills) > 0:
-        p = fills[0].get("price") or fills[0].get("priceStr")
-        try: return float(p)
-        except: pass
-    p = order.get("price")
-    try: return float(p)
-    except: return None
-
-# ---------------- STATE ----------------
-last_tick_price = price_now()
-if last_tick_price is None:
-    raise SystemExit("Cannot fetch initial price.")
-
-in_position = False
-entry_price = None
-position_qty = 0.0
-
-log("START scalper B1", SYMBOL, "dry_run=", DRY_RUN)
-log("CONFIG: DUMP_TH=", DUMP_THRESHOLD, "TP_gross=", PROFIT_TARGET_GROSS if 'PROFIT_TARGET_GROSS' in globals() else PROFIT_TARGET_GROSS)
-
-# (note: keep small sleep before main loop to let API warm up)
-time.sleep(0.2)
-
-# ---------------- MAIN LOOP ----------------
-while True:
-    try:
-        price = price_now()
-        if price is None:
-            time.sleep(CHECK_INTERVAL)
-            continue
-
-        # compute immediate % change vs last tick (quick micro-dump detector)
-        change = (price - last_tick_price) / last_tick_price
-        last_tick_price = price  # update for next tick
-
-        usdt_free, base_free = fetch_balances()
-        if usdt_free is None:
-            time.sleep(CHECK_INTERVAL)
-            continue
-
-        log(f"Price={price:.6f} change={change*100:.3f}% USDT_free={usdt_free:.4f} {base_asset}_free={base_free:.6f}")
-
-        # ---------- BUY (aggressive many-entry logic) ----------
-        if (not in_position) and usdt_free >= MIN_NOTIONAL_USDT:
-            # if quick drop beyond threshold => buy all-in (approx)
-            if change <= -DUMP_THRESHOLD:
-                # use almost all USDT but keep tiny buffer
-                cap = usdt_free * USE_USDT_FRAC
-                raw_amount = cap / price
-                amount = amount_to_precision(SYMBOL, raw_amount)
-                notional = amount * price
-                if notional < MIN_NOTIONAL_USDT:
-                    log("Computed notional too small:", notional, "skip buy")
-                else:
-                    log(f"BUY condition met: change={change*100:.3f}%, buying amount={amount} (notional {notional:.4f})")
-                    if DRY_RUN:
-                        log("(dry_run) Simulated BUY:", amount, "at", price)
-                        fill_price = price
-                    else:
-                        order = safe_call(lambda: exchange.create_market_buy_order(SYMBOL, amount))
-                        log("buy order:", order)
-                        fill_price = extract_fill_price(order) or price
-                    # set position
-                    in_position = True
-                    entry_price = float(fill_price)
-                    position_qty = amount
-                    log("ENTER position entry_price=", entry_price, "qty=", position_qty)
-                    # short pause after buy
-                    time.sleep(0.6)
-                    continue
-
-        # ---------- SELL (take profit or stoploss) ----------
-        if in_position and position_qty > 0:
-            gross_change = (price - entry_price) / entry_price  # e.g. 0.003 => 0.3%
-            total_fee = FEE_PER_SIDE * 2.0
-            net_change = gross_change - total_fee
-            log(f"In pos entry={entry_price:.6f} gross={gross_change*100:.3f}% net(after fees)={net_change*100:.3f}%")
-
-            # SELL when gross reaches profit target (we accept gross target so net > 0)
-            if gross_change >= PROFIT_TARGET_GROSS:
-                log("TP reached (gross). SELLING ALL")
-                if DRY_RUN:
-                    log("(dry_run) Simulated SELL:", position_qty, "at", price)
-                else:
-                    order = safe_call(lambda: exchange.create_market_sell_order(SYMBOL, position_qty))
-                    log("sell order:", order)
-                # reset
-                in_position = False
-                entry_price = None
-                position_qty = 0.0
-                # small cooldown
-                time.sleep(0.6)
-                continue
-
-            # SELL if net_change already positive above small margin (optionally)
-            # (This branch optional; left commented for clarity)
-            # if net_change >= 0.0005:
-            #     log("Net positive threshold reached -> SELL")
-            #     ...
-
-            # STOP LOSS (hard)
-            if gross_change <= -STOP_LOSS:
-                log("STOP-LOSS hit -> SELL ALL")
-                if DRY_RUN:
-                    log("(dry_run) Simulated STOP SELL:", position_qty, "at", price)
-                else:
-                    order = safe_call(lambda: exchange.create_market_sell_order(SYMBOL, position_qty))
-                    log("stop sell order:", order)
-                in_position = False
-                entry_price = None
-                position_qty = 0.0
-                time.sleep(0.6)
-                continue
-
-        # loop sleep
-        time.sleep(CHECK_INTERVAL)
-
-    except KeyboardInterrupt:
-        log("KeyboardInterrupt — exiting")
-        break
-    except Exception as e:
-        log("ERROR main loop:", e)
-        time.sleep(1.0)
+if __name__ == "__main__":
+    main()
